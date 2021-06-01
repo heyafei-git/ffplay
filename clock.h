@@ -15,5 +15,7 @@ typedef struct Clock {
     int *queue_serial;    /* pointer to the current packet queue serial, used for obsolete clock detection */
 } Clock;
 
+void init_clock(Clock *c, int *queue_serial);
+
 
 #endif //BJY_CLOCK_H

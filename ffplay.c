@@ -24,9 +24,7 @@
  */
 
 #include "config.h"
-#include "queue.h"
-#include "clock.h"
-#include "opt.h"
+#include "sdl.h"
 
 #include <inttypes.h>
 #include <math.h>
@@ -49,16 +47,7 @@
 #include "libavdevice/avdevice.h"
 #include "libswscale/swscale.h"
 #include "libavutil/opt.h"
-#include "libavcodec/avfft.h"
 #include "libswresample/swresample.h"
-
-#if CONFIG_AVFILTER
-# include "libavfilter/avfilter.h"
-# include "libavfilter/buffersink.h"
-# include "libavfilter/buffersrc.h"
-#endif
-
-#include <SDL_thread.h>
 
 #include "cmdutils.h"
 
@@ -103,9 +92,6 @@ const int program_birth_year = 2003;
 /* polls for possible required screen refresh at least this often, should be less than 1/fps */
 #define REFRESH_RATE 0.01
 
-/* NOTE: the size must be big enough to compensate the hardware audio buffersize size */
-/* TODO: We assume that a decoded and resampled frame fits into this buffer */
-#define SAMPLE_ARRAY_SIZE (8 * 65536)
 
 #define CURSOR_HIDE_DELAY 1000000
 
@@ -113,152 +99,14 @@ const int program_birth_year = 2003;
 
 static unsigned sws_flags = SWS_BICUBIC;
 
-
-typedef struct AudioParams {
-    int freq;
-    int channels;
-    int64_t channel_layout;
-    enum AVSampleFormat fmt;
-    int frame_size;
-    int bytes_per_sec;
-} AudioParams;
-
-typedef struct Decoder {
-    AVPacket *pkt;
-    PacketQueue *queue;
-    AVCodecContext *avctx;
-    int pkt_serial;
-    int finished;
-    int packet_pending;
-    SDL_cond *empty_queue_cond;
-    int64_t start_pts;
-    AVRational start_pts_tb;
-    int64_t next_pts;
-    AVRational next_pts_tb;
-    SDL_Thread *decoder_tid;
-} Decoder;
-
-typedef struct VideoState {
-    SDL_Thread *read_tid;
-    const AVInputFormat *iformat;
-    int abort_request;
-    int force_refresh;
-    int paused;
-    int last_paused;
-    int queue_attachments_req;
-    int seek_req;
-    int seek_flags;
-    int64_t seek_pos;
-    int64_t seek_rel;
-    int read_pause_return;
-    AVFormatContext *ic;
-    int realtime;
-
-    Clock audclk;
-    Clock vidclk;
-    Clock extclk;
-
-    FrameQueue pictq;
-    FrameQueue subpq;
-    FrameQueue sampq;
-
-    Decoder auddec;
-    Decoder viddec;
-    Decoder subdec;
-
-    int audio_stream;
-
-    int av_sync_type;
-
-    double audio_clock;
-    int audio_clock_serial;
-    double audio_diff_cum; /* used for AV difference average computation */
-    double audio_diff_avg_coef;
-    double audio_diff_threshold;
-    int audio_diff_avg_count;
-    AVStream *audio_st;
-    PacketQueue audioq;
-    int audio_hw_buf_size;
-    uint8_t *audio_buf;
-    uint8_t *audio_buf1;
-    unsigned int audio_buf_size; /* in bytes */
-    unsigned int audio_buf1_size;
-    int audio_buf_index; /* in bytes */
-    int audio_write_buf_size;
-    int audio_volume;
-    int muted;
-    struct AudioParams audio_src;
-#if CONFIG_AVFILTER
-    struct AudioParams audio_filter_src;
-#endif
-    struct AudioParams audio_tgt;
-    struct SwrContext *swr_ctx;
-    int frame_drops_early;
-    int frame_drops_late;
-
-    enum ShowMode show_mode;
-    int16_t sample_array[SAMPLE_ARRAY_SIZE];
-    int sample_array_index;
-    int last_i_start;
-    RDFTContext *rdft;
-    int rdft_bits;
-    FFTSample *rdft_data;
-    int xpos;
-    double last_vis_time;
-    SDL_Texture *vis_texture;
-    SDL_Texture *sub_texture;
-    SDL_Texture *vid_texture;
-
-    int subtitle_stream;
-    AVStream *subtitle_st;
-    PacketQueue subtitleq;
-
-    double frame_timer;
-    double frame_last_returned_time;
-    double frame_last_filter_delay;
-    int video_stream;
-    AVStream *video_st;
-    PacketQueue videoq;
-    double max_frame_duration;      // maximum duration of a frame - above this, we consider the jump a timestamp discontinuity
-    struct SwsContext *img_convert_ctx;
-    struct SwsContext *sub_convert_ctx;
-    int eof;
-
-    char *filename;
-    int width, height, xleft, ytop;
-    int step;
-
-#if CONFIG_AVFILTER
-    int vfilter_idx;
-    AVFilterContext *in_video_filter;   // the first filter in the video chain
-    AVFilterContext *out_video_filter;  // the last filter in the video chain
-    AVFilterContext *in_audio_filter;   // the first filter in the audio chain
-    AVFilterContext *out_audio_filter;  // the last filter in the audio chain
-    AVFilterGraph *agraph;              // audio filter graph
-#endif
-
-    int last_video_stream, last_audio_stream, last_subtitle_stream;
-
-    SDL_cond *continue_read_thread;
-} VideoState;
-
-
-static int default_width  = 640;
-static int default_height = 480;
-
 static int64_t cursor_last_shown;
 static int cursor_hidden = 0;
-
 
 /* current context */
 static int64_t audio_callback_time;
 
 #define FF_QUIT_EVENT    (SDL_USEREVENT + 2)
 
-static SDL_Window *window;
-static SDL_Renderer *renderer;
-static SDL_RendererInfo renderer_info = {0};
-static SDL_AudioDeviceID audio_dev;
 
 static const struct TextureFormatEntry {
     enum AVPixelFormat format;
@@ -892,7 +740,7 @@ static void stream_close(VideoState *is)
     av_free(is);
 }
 
-static void do_exit(VideoState *is)
+void do_exit(VideoState *is)
 {
     if (is) {
         stream_close(is);
@@ -2640,8 +2488,7 @@ static int read_thread(void *arg)
         pkt_in_play_range = duration == AV_NOPTS_VALUE ||
                             (pkt_ts - (stream_start_time != AV_NOPTS_VALUE ? stream_start_time : 0)) *
                             av_q2d(ic->streams[pkt->stream_index]->time_base) -
-                            (double)(start_time != AV_NOPTS_VALUE ? start_time : 0) / 1000000
-                            <= ((double)duration / 1000000);
+                            (double)(start_time != AV_NOPTS_VALUE ? start_time : 0) / 1000000 <= ((double)duration / 1000000);
         if (pkt->stream_index == is->audio_stream && pkt_in_play_range) {
             packet_queue_put(&is->audioq, pkt);
         } else if (pkt->stream_index == is->video_stream && pkt_in_play_range
@@ -2677,14 +2524,15 @@ static VideoState *stream_open(const char *filename,
     VideoState *is;
 
     is = av_mallocz(sizeof(VideoState));
-    if (!is)
-        return NULL;
+    if (!is) return NULL;
+
     is->last_video_stream = is->video_stream = -1;
     is->last_audio_stream = is->audio_stream = -1;
     is->last_subtitle_stream = is->subtitle_stream = -1;
     is->filename = av_strdup(filename);
-    if (!is->filename)
-        goto fail;
+
+    if (!is->filename) goto fail;
+
     is->iformat = iformat;
     is->ytop    = 0;
     is->xleft   = 0;
@@ -3074,7 +2922,6 @@ static void event_loop(VideoState *cur_stream)
 /* Called from the main */
 int main(int argc, char **argv)
 {
-    int flags;
     VideoState *is;
 
     init_dynload();
@@ -3105,59 +2952,8 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    if (display_disable) {
-        video_disable = 1;
-    }
-    flags = SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER;
-    if (audio_disable)
-        flags &= ~SDL_INIT_AUDIO;
-    else {
-        /* Try to work around an occasional ALSA buffer underflow issue when the
-         * period size is NPOT due to ALSA resampling by forcing the buffer size. */
-        if (!SDL_getenv("SDL_AUDIO_ALSA_SET_BUFFER_SIZE"))
-            SDL_setenv("SDL_AUDIO_ALSA_SET_BUFFER_SIZE","1", 1);
-    }
-    if (display_disable)
-        flags &= ~SDL_INIT_VIDEO;
-    if (SDL_Init (flags)) {
-        av_log(NULL, AV_LOG_FATAL, "Could not initialize SDL - %s\n", SDL_GetError());
-        av_log(NULL, AV_LOG_FATAL, "(Did you set the DISPLAY variable?)\n");
-        exit(1);
-    }
-
-    SDL_EventState(SDL_SYSWMEVENT, SDL_IGNORE);
-    SDL_EventState(SDL_USEREVENT, SDL_IGNORE);
-
-    if (!display_disable) {
-        int flags = SDL_WINDOW_HIDDEN;
-        if (alwaysontop)
-#if SDL_VERSION_ATLEAST(2,0,5)
-            flags |= SDL_WINDOW_ALWAYS_ON_TOP;
-#else
-        av_log(NULL, AV_LOG_WARNING, "Your SDL version doesn't support SDL_WINDOW_ALWAYS_ON_TOP. Feature will be inactive.\n");
-#endif
-        if (borderless)
-            flags |= SDL_WINDOW_BORDERLESS;
-        else
-            flags |= SDL_WINDOW_RESIZABLE;
-        window = SDL_CreateWindow(program_name, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, default_width, default_height, flags);
-        SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
-        if (window) {
-            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-            if (!renderer) {
-                av_log(NULL, AV_LOG_WARNING, "Failed to initialize a hardware accelerated renderer: %s\n", SDL_GetError());
-                renderer = SDL_CreateRenderer(window, -1, 0);
-            }
-            if (renderer) {
-                if (!SDL_GetRendererInfo(renderer, &renderer_info))
-                    av_log(NULL, AV_LOG_VERBOSE, "Initialized %s renderer.\n", renderer_info.name);
-            }
-        }
-        if (!window || !renderer || !renderer_info.num_texture_formats) {
-            av_log(NULL, AV_LOG_FATAL, "Failed to create window or renderer: %s", SDL_GetError());
-            do_exit(NULL);
-        }
-    }
+    // init sdl
+    sdl_init();
 
     is = stream_open(input_filename, file_iformat);
     if (!is) {

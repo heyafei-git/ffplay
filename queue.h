@@ -7,7 +7,7 @@
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/fifo.h>
-#include <SDL_thread.h>
+#include <pthread.h>
 
 typedef struct MyAVPacketList {
     AVPacket *pkt;
@@ -21,8 +21,8 @@ typedef struct PacketQueue {
     int64_t duration;
     int abort_request;
     int serial;
-    SDL_mutex *mutex;
-    SDL_cond *cond;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
 } PacketQueue;
 
 /* Common struct for handling all types of decoded data and allocated render buffers. */
@@ -54,8 +54,8 @@ typedef struct FrameQueue {
     int max_size;
     int keep_last;
     int rindex_shown;
-    SDL_mutex *mutex;
-    SDL_cond *cond;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
     PacketQueue *pktq;
 } FrameQueue;
 
